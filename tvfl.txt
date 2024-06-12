@@ -1,20 +1,109 @@
-To use AWS Secrets Manager to pass your `appsettings.production.json` file content to your ECS Fargate task, you need to store the JSON in Secrets Manager and then retrieve it within your application. Here's a step-by-step guide along with the CloudFormation template to achieve this:
+When running a Docker container on AWS ECS Fargate, you cannot use bind mounts as you do in Docker locally. Instead, you have several options for providing configuration files to your containers, including using Amazon EFS (Elastic File System), ECS task definitions with environment variables, or AWS Secrets Manager/SSM Parameter Store. Here is a breakdown of these options along with a CloudFormation template for using EFS.
 
-### Step 1: Store JSON in Secrets Manager
+### Option 1: Using Amazon EFS
 
-First, store your `appsettings.production.json` content in AWS Secrets Manager:
+1. **Create an EFS File System**: Create an EFS file system and store your `appsettings.production.json` file there.
 
-```bash
-aws secretsmanager create-secret --name /app/config/appsettings.production --secret-string file://appsettings.production.json
+2. **Mount EFS in ECS Task**: Use CloudFormation to mount the EFS volume in your ECS task definition.
+
+### CloudFormation Template for EFS
+
+```yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  EFSFileSystem:
+    Type: 'AWS::EFS::FileSystem'
+    Properties:
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_30_DAYS
+
+  MountTarget:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: <YourSubnetId>
+      SecurityGroups:
+        - <YourSecurityGroupId>
+
+  EcsTaskExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: 'EcsTaskExecutionPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - efs:ClientMount
+                  - efs:ClientWrite
+                  - efs:DescribeFileSystems
+                Resource: '*'
+
+  EcsTaskDefinition:
+    Type: 'AWS::ECS::TaskDefinition'
+    Properties:
+      Family: 'my-task-family'
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: 'my-container'
+          Image: 'econsulting/image:1.0.0'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 8080
+          MountPoints:
+            - SourceVolume: 'efs-volume'
+              ContainerPath: '/app'
+      Volumes:
+        - Name: 'efs-volume'
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref EFSFileSystem
+            RootDirectory: '/'
+
+  EcsService:
+    Type: 'AWS::ECS::Service'
+    Properties:
+      Cluster: <YourEcsCluster>
+      DesiredCount: 1
+      TaskDefinition: !Ref EcsTaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - <YourSubnetId>
+          SecurityGroups:
+            - <YourSecurityGroupId>
 ```
 
-### Step 2: Create IAM Role for ECS Task Execution
+### Option 2: Using AWS Secrets Manager or SSM Parameter Store
 
-Ensure your ECS task execution role has permissions to retrieve the secret from Secrets Manager.
+Store your `appsettings.production.json` file contents in AWS Secrets Manager or SSM Parameter Store and then retrieve it in your application at runtime.
 
-### CloudFormation Template
+### Option 3: Environment Variables
 
-Here's a CloudFormation template that creates an ECS Fargate service using Secrets Manager to provide the configuration file to the container:
+Directly set the contents or path of your configuration file as an environment variable in your ECS task definition.
+
+### Example for Option 2 and 3 using SSM Parameter Store with Environment Variables
+
+#### Store the JSON content in SSM Parameter Store:
+```bash
+aws ssm put-parameter --name "/app/config/appsettings.production.json" --value '{"YourKey": "YourValue"}' --type "String"
+```
+
+#### CloudFormation Template to Pass SSM Parameter to ECS Task
 
 ```yaml
 AWSTemplateFormatVersion: '2010-09-09'
@@ -30,14 +119,14 @@ Resources:
               Service: ecs-tasks.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: 'SecretsManagerReadPolicy'
+        - PolicyName: 'SSMParameterReadPolicy'
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
-                  - secretsmanager:GetSecretValue
-                Resource: 'arn:aws:secretsmanager:<region>:<account-id>:secret:/app/config/appsettings.production-<random-id>'
+                  - ssm:GetParameter
+                Resource: 'arn:aws:ssm:<region>:<account-id>:parameter/app/config/appsettings.production.json'
 
   EcsTaskDefinition:
     Type: 'AWS::ECS::TaskDefinition'
@@ -58,7 +147,7 @@ Resources:
               HostPort: 8080
           Environment:
             - Name: 'APP_CONFIG'
-              Value: !Sub '{{resolve:secretsmanager:/app/config/appsettings.production:SecretString}}'
+              Value: !Sub '{{resolve:ssm:/app/config/appsettings.production.json}}'
 
   EcsService:
     Type: 'AWS::ECS::Service'
@@ -75,25 +164,4 @@ Resources:
             - <YourSecurityGroupId>
 ```
 
-### Explanation:
-
-1. **EcsTaskExecutionRole**: Defines the IAM role with permissions to retrieve the secret from Secrets Manager.
-   - The policy allows the ECS task to call `secretsmanager:GetSecretValue` on the specified secret ARN.
-
-2. **EcsTaskDefinition**: Defines the ECS task with the container definition.
-   - The `Environment` variable `APP_CONFIG` is set using the Secrets Manager ARN syntax for environment variables.
-
-3. **EcsService**: Creates the ECS service using the task definition.
-
-Replace the placeholders like `<YourSubnetId>`, `<YourSecurityGroupId>`, `<YourEcsCluster>`, `<region>`, and `<account-id>` with your actual AWS resource identifiers.
-
-### Application Code
-
-In your application, retrieve the environment variable `APP_CONFIG` and parse it as needed. For example, in a Node.js application:
-
-```javascript
-const config = JSON.parse(process.env.APP_CONFIG);
-console.log(config);
-```
-
-By using this setup, your ECS Fargate task can securely retrieve the `appsettings.production.json` content from AWS Secrets Manager at runtime.
+Replace placeholders like `<YourSubnetId>`, `<YourSecurityGroupId>`, `<YourEcsCluster>`, `<region>`, and `<account-id>` with your actual AWS resource identifiers. This setup allows you to use EFS for file mounting or SSM Parameter Store for environment variable injection, providing flexibility depending on your use case.
