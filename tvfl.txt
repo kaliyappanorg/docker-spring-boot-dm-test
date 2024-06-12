@@ -1,0 +1,99 @@
+To use AWS Secrets Manager to pass your `appsettings.production.json` file content to your ECS Fargate task, you need to store the JSON in Secrets Manager and then retrieve it within your application. Here's a step-by-step guide along with the CloudFormation template to achieve this:
+
+### Step 1: Store JSON in Secrets Manager
+
+First, store your `appsettings.production.json` content in AWS Secrets Manager:
+
+```bash
+aws secretsmanager create-secret --name /app/config/appsettings.production --secret-string file://appsettings.production.json
+```
+
+### Step 2: Create IAM Role for ECS Task Execution
+
+Ensure your ECS task execution role has permissions to retrieve the secret from Secrets Manager.
+
+### CloudFormation Template
+
+Here's a CloudFormation template that creates an ECS Fargate service using Secrets Manager to provide the configuration file to the container:
+
+```yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  EcsTaskExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: 'SecretsManagerReadPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: 'arn:aws:secretsmanager:<region>:<account-id>:secret:/app/config/appsettings.production-<random-id>'
+
+  EcsTaskDefinition:
+    Type: 'AWS::ECS::TaskDefinition'
+    Properties:
+      Family: 'my-task-family'
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: 'my-container'
+          Image: 'econsulting/image:1.0.0'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 8080
+          Environment:
+            - Name: 'APP_CONFIG'
+              Value: !Sub '{{resolve:secretsmanager:/app/config/appsettings.production:SecretString}}'
+
+  EcsService:
+    Type: 'AWS::ECS::Service'
+    Properties:
+      Cluster: <YourEcsCluster>
+      DesiredCount: 1
+      TaskDefinition: !Ref EcsTaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - <YourSubnetId>
+          SecurityGroups:
+            - <YourSecurityGroupId>
+```
+
+### Explanation:
+
+1. **EcsTaskExecutionRole**: Defines the IAM role with permissions to retrieve the secret from Secrets Manager.
+   - The policy allows the ECS task to call `secretsmanager:GetSecretValue` on the specified secret ARN.
+
+2. **EcsTaskDefinition**: Defines the ECS task with the container definition.
+   - The `Environment` variable `APP_CONFIG` is set using the Secrets Manager ARN syntax for environment variables.
+
+3. **EcsService**: Creates the ECS service using the task definition.
+
+Replace the placeholders like `<YourSubnetId>`, `<YourSecurityGroupId>`, `<YourEcsCluster>`, `<region>`, and `<account-id>` with your actual AWS resource identifiers.
+
+### Application Code
+
+In your application, retrieve the environment variable `APP_CONFIG` and parse it as needed. For example, in a Node.js application:
+
+```javascript
+const config = JSON.parse(process.env.APP_CONFIG);
+console.log(config);
+```
+
+By using this setup, your ECS Fargate task can securely retrieve the `appsettings.production.json` content from AWS Secrets Manager at runtime.
